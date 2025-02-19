@@ -4,6 +4,8 @@ from torch.nn import functional as F
 import math
 from dataclasses import dataclass
 import transformers
+import os
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 
 class CausalSelfAttention(nn.Module):
@@ -16,30 +18,31 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
 
         self.n_head = config.n_head
-        self.n_embd = config.n_embd
+        self.n_embd = config.n_embd 
 
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                             .view(1,1,config.block_size,config.block_size))
+                                    .view(1,1,config.block_size,config.block_size))
         
-        def forward(self, x):
-            B,T,C = x.size()
+    def forward(self, x):
+        B,T,C = x.size()
 
-            qvk = self.c_attn(x)
+        qkv = self.c_attn(x)
 
-            q,v,k = qvk.split(self.n_embd, dim=2)
+        q,k,v = qkv.split(self.n_embd, dim=2)
 
-            k = k.view(B,T,self.n_head, C//self.n_head).transpose(1,2) # (B,n_head,T,head_size) C = n_head*head_size
-            q = q.view(B,T,self.n_head, C//self.n_head).transpose(1,2)
-            v = v.view(B,T,self.n_head, C//self.n_head).transpose(1,2)
+        k = k.view(B,T,self.n_head, C//self.n_head).transpose(1,2) # (B,n_head,T,head_size) C = n_head*head_size
+        q = q.view(B,T,self.n_head, C//self.n_head).transpose(1,2)
+        v = v.view(B,T,self.n_head, C//self.n_head).transpose(1,2)
 
-            att = (q @ k.transpose(-2,-1)) *(1/math.sqrt(k.size(-1)))
+        att = (q @ k.transpose(-2,-1)) *(1/ math.sqrt(k.size(-1)))
 
-            att = att.masked_fill(self.bias[:,:,:T,:T] ==0,float('-inf'))
-            att = F.softmax(att, dim=-1)
-            y = att * v 
-            y = y.transpose(1,2).conmtiguous().veiw(B,T,C)
-            y = self.c_proj(y)
-            return y                                                                                                                                            
+        att = att.masked_fill(self.bias[:,:,:T,:T] ==0,float('-inf'))
+        att = F.softmax(att, dim=-1)
+        y = att @ v 
+        y = y.transpose(1,2).contiguous().view(B,T,C)
+        y = self.c_proj(y)
+        return y   
+                                                                                                                                   
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -49,7 +52,7 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
 
     def forward(self, x):
-        x = self.c_proj(x)
+        x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
         return x
@@ -65,10 +68,9 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x+ self.attn(self.ln_1(x))
+        x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
-
 
 
 
@@ -78,7 +80,8 @@ class GPTConfig:
     vocab_size: int = 50257
     n_embd: int = 768
     n_head: int = 12
-    n_layer: int = 768  
+    n_layer: int = 12 
+
 
 class GPT(nn.Module):
 
@@ -93,6 +96,28 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd)
         ))
         self.lm_head = nn.Linear(config.n_embd,config.vocab_size,bias=False)
+
+
+    def forward(self, idx):
+        B,T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+
+        pos = torch.arange(0,T,dtype=torch.long,device=idx.device) #(T)
+        pos_emb = self.transformer.wpe(pos) #(T,n_embd)
+        tok_emb = self.transformer.wte (idx) #(B,T,n_embd)
+
+        x = tok_emb + pos_emb
+
+        for block in self.transformer.h:
+            x = block(x)
+        
+        x = self.transformer.ln_f(x)
+
+        logits = self.lm_head(x)
+
+        return logits
+
+
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -112,7 +137,6 @@ class GPT(nn.Module):
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
-        # config = GPTConfig()
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
@@ -148,3 +172,58 @@ class GPT(nn.Module):
 #--------------------------------------------------------------------------------------
 model = GPT.from_pretrained('gpt2')
 print('hehe')
+
+# sd = model.state_dict()
+# for k,v in sd.items():
+#   print(k,v.shape)
+
+# print(sd['transformer.wpe.weight'][1][:20])
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+model.eval()
+model.to(device)
+
+
+num_return_sequences = 5
+max_length = 30
+
+import tiktoken
+
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model, ")
+tokens = torch.tensor(tokens, dtype= torch.long)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences,1)
+
+x = tokens.to(device)
+
+
+def generate(x,max_length, num_return_sequences):
+    
+    while x.size(1) < max_length:
+
+        with torch.no_grad():
+            logits = model(x) #(B,T,vocab_size)
+
+            logits = logits[:,-1,:] #(B,vocab_size) 
+
+            probs = F.softmax(logits, dim=-1)
+
+            topk_probs, topk_indices = torch.topk(probs,50,dim=-1)
+
+            ix = torch.multinomial(topk_probs, 1)
+
+            xcol = torch.gather(topk_indices,-1,ix)
+
+            x = torch.cat((x,xcol),dim=1)
+           
+
+
+    for i in range(num_return_sequences):
+        tokens = x[i,:max_length].tolist()
+        decode = enc.decode(tokens)
+        print(">>", decode)
+
+generate(x,max_length,num_return_sequences)
+
+
