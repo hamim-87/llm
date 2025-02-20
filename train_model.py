@@ -5,6 +5,7 @@ import math
 from dataclasses import dataclass
 import transformers
 import os
+import tiktoken
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 
@@ -98,7 +99,7 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd,config.vocab_size,bias=False)
 
 
-    def forward(self, idx):
+    def forward(self, idx,targets = None):
         B,T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
@@ -115,7 +116,11 @@ class GPT(nn.Module):
 
         logits = self.lm_head(x)
 
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1,logits.size(-1)), targets.view(-1))
+
+        return logits,loss
 
 
 
@@ -170,27 +175,94 @@ class GPT(nn.Module):
     
 
 #--------------------------------------------------------------------------------------
-model = GPT.from_pretrained('gpt2')
-print('hehe')
 
+
+#device check 
+if torch.cuda.is_available():
+    print("using device cuda")
+else: 
+    print("using device cpu")
+
+#inintialize the model with gpt2 weights 
+# model = GPT.from_pretrained('gpt2')
+# print('hehe gpt2')
+
+
+#initialize the model wiht random value
+model = GPT(GPTConfig())
+print("hehe random")
+
+# model layer checking
 # sd = model.state_dict()
 # for k,v in sd.items():
 #   print(k,v.shape)
 
+# sanity check 
 # print(sd['transformer.wpe.weight'][1][:20])
+
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-model.eval()
+# model.eval()
 model.to(device)
 
 
+#encode 
+enc = tiktoken.get_encoding('gpt2')
+
+
+# TRAINING PERPOSE 
+
+with open('input.txt', 'r') as f:
+    text = f.read()
+
+
+tokens = enc.encode(text)
+
+
+B,T = 4,32
+
+buf = torch.tensor(tokens[:B*T+1])
+buf = buf.to(device)
+x = buf[:-1].view(B,T)
+y = buf[1:].view(B,T)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4)
+
+for i in range(50):
+    optimizer.zero_grad()
+    logits,loss = model(x,y)
+    loss.backward()
+    optimizer.step()
+
+
+    print(f"step {i}: loss: {loss}")
+
+import sys; sys.exit(0)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#generate text constant
 num_return_sequences = 5
 max_length = 30
 
-import tiktoken
 
-enc = tiktoken.get_encoding('gpt2')
+# creating the input x
+
+
+
 tokens = enc.encode("Hello, I'm a language model, ")
 tokens = torch.tensor(tokens, dtype= torch.long)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences,1)
